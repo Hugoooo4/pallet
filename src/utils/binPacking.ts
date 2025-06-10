@@ -1,7 +1,7 @@
 import { Package, PlacedPackage, PalletConfig, Position, Rotation, RotationType } from '../types/pallet';
 
-// Tolerance for rounding errors (0.5cm = 0.005m)
-const ROUNDING_TOLERANCE = 0.005;
+// Tolerance for rounding errors (0.05cm = 0.0005m)
+const ROUNDING_TOLERANCE = 0.0005;
 
 // Helper function to check if two numbers are approximately equal
 const approxEqual = (a: number, b: number): boolean => {
@@ -12,6 +12,20 @@ const approxEqual = (a: number, b: number): boolean => {
 const approxLessOrEqual = (a: number, b: number): boolean => {
   return a <= b || approxEqual(a, b);
 };
+
+interface PackageType {
+  dimensions: { length: number; width: number; height: number };
+  count: number;
+  weight: number;
+  rotationType: RotationType;
+  packages: Package[];
+}
+
+interface LayerPlan {
+  packages: PlacedPackage[];
+  height: number;
+  efficiency: number;
+}
 
 export class BinPackingAlgorithm {
   private palletConfig: PalletConfig;
@@ -33,235 +47,429 @@ export class BinPackingAlgorithm {
 
     const expandedPackages = this.expandPackages(packages);
     
-    // Calculate current volume utilization
-    const currentResult = this.tryBasicPacking([...expandedPackages]);
-    const volumeUtilization = this.calculateVolumeUtilization(currentResult);
+    // Group packages by type for optimized handling
+    const packageTypes = this.groupPackagesByType(expandedPackages);
     
-    // If volume utilization is less than 100%, try comprehensive layer optimization
-    if (volumeUtilization < 1.0) {
-      const optimizedResult = this.tryLayerOptimization(expandedPackages);
-      if (optimizedResult.length > currentResult.length) {
-        return optimizedResult;
-      }
-    }
-
-    return currentResult;
-  }
-
-  private calculateVolumeUtilization(placedPackages: PlacedPackage[]): number {
-    const usedVolume = placedPackages.reduce((total, pkg) => {
-      return total + (pkg.actualLength * pkg.actualWidth * pkg.actualHeight);
-    }, 0);
-    const palletLoadVolume = this.palletConfig.length * this.palletConfig.width * this.palletConfig.loadHeight;
-    return usedVolume / palletLoadVolume;
-  }
-
-  private tryLayerOptimization(packages: Package[]): PlacedPackage[] {
-    let bestResult: PlacedPackage[] = [];
-    let bestCount = 0;
-
-    // Group packages by similar dimensions for layer optimization
-    const packageGroups = this.groupSimilarPackages(packages);
-    
-    // Try different combinations for the first two layers
-    for (const group1 of packageGroups) {
-      for (const group2 of packageGroups) {
-        const result = this.tryTwoLayerCombination(group1, group2, packages);
-        if (result.length > bestCount) {
-          bestCount = result.length;
-          bestResult = [...result];
-        }
-      }
-    }
-
-    return bestResult.length > 0 ? bestResult : this.tryBasicPacking(packages);
-  }
-
-  private groupSimilarPackages(packages: Package[]): Package[][] {
-    const groups: Package[][] = [];
-    const used = new Set<string>();
-
-    for (const pkg of packages) {
-      if (used.has(pkg.id)) continue;
-      
-      const group = [pkg];
-      used.add(pkg.id);
-      
-      // Find similar packages (within 10% size difference)
-      for (const other of packages) {
-        if (used.has(other.id)) continue;
-        
-        const sizeDiff = Math.abs((pkg.length * pkg.width * pkg.height) - (other.length * other.width * other.height)) / 
-                        (pkg.length * pkg.width * pkg.height);
-        
-        if (sizeDiff <= 0.1) {
-          group.push(other);
-          used.add(other.id);
-        }
-      }
-      
-      groups.push(group);
-    }
-
-    return groups;
-  }
-
-  private tryTwoLayerCombination(layer1Packages: Package[], layer2Packages: Package[], allPackages: Package[]): PlacedPackage[] {
-    this.placedPackages = [];
-    this.initializePositions();
-
-    // Fill first layer with priority orientations
-    this.fillLayerWithPriority(layer1Packages, this.palletConfig.baseHeight);
-    
-    // Get height of first layer
-    const firstLayerHeight = this.getMaxHeight();
-    
-    // Fill second layer if there's space
-    if (firstLayerHeight < this.palletConfig.baseHeight + this.palletConfig.loadHeight) {
-      this.fillLayerWithPriority(layer2Packages, firstLayerHeight);
-    }
-
-    // Fill remaining space with remaining packages
-    const usedIds = new Set(this.placedPackages.map(p => p.id));
-    const remainingPackages = allPackages.filter(p => !usedIds.has(p.id));
-    
-    for (const pkg of remainingPackages) {
-      if (this.canAddPackageWeight(pkg.weight)) {
-        this.placePackageOptimized(pkg);
-      }
-    }
-
-    return [...this.placedPackages];
-  }
-
-  private fillLayerWithPriority(packages: Package[], startHeight: number): void {
-    // Priority 1: Original orientation
-    for (const pkg of packages) {
-      if (this.canAddPackageWeight(pkg.weight)) {
-        const originalRotation: Rotation = {
-          length: pkg.length,
-          width: pkg.width,
-          height: pkg.height,
-          rotationAngles: [0, 0, 0]
-        };
-        
-        const position = this.findBestPositionForRotation(originalRotation, startHeight);
-        if (position) {
-          const placedPackage = this.createPlacedPackage(pkg, position, originalRotation);
-          this.placedPackages.push(placedPackage);
-          this.updateAvailablePositions(placedPackage);
-          this.removeUsedPosition(position);
-        }
-      }
-    }
-
-    // Priority 2: Both horizontal orientations (if allowed)
-    const remainingPackages = packages.filter(pkg => 
-      !this.placedPackages.some(p => p.id === pkg.id) && pkg.rotationType !== 'vertical'
-    );
-
-    for (const pkg of remainingPackages) {
-      if (this.canAddPackageWeight(pkg.weight)) {
-        // Test first horizontal rotation (90 degrees)
-        const horizontalRotation1: Rotation = {
-          length: pkg.width,
-          width: pkg.length,
-          height: pkg.height,
-          rotationAngles: [0, Math.PI / 2, 0]
-        };
-        
-        const position1 = this.findBestPositionForRotation(horizontalRotation1, startHeight);
-        if (position1) {
-          const placedPackage = this.createPlacedPackage(pkg, position1, horizontalRotation1);
-          this.placedPackages.push(placedPackage);
-          this.updateAvailablePositions(placedPackage);
-          this.removeUsedPosition(position1);
-          continue; // Move to next package
-        }
-
-        // Test second horizontal rotation (original orientation again if first failed)
-        const horizontalRotation2: Rotation = {
-          length: pkg.length,
-          width: pkg.width,
-          height: pkg.height,
-          rotationAngles: [0, 0, 0]
-        };
-        
-        const position2 = this.findBestPositionForRotation(horizontalRotation2, startHeight);
-        if (position2) {
-          const placedPackage = this.createPlacedPackage(pkg, position2, horizontalRotation2);
-          this.placedPackages.push(placedPackage);
-          this.updateAvailablePositions(placedPackage);
-          this.removeUsedPosition(position2);
-        }
-      }
-    }
-
-    // Priority 3: All rotations (if allowed)
-    const stillRemainingPackages = packages.filter(pkg => 
-      !this.placedPackages.some(p => p.id === pkg.id) && pkg.rotationType === 'all'
-    );
-
-    for (const pkg of stillRemainingPackages) {
-      if (this.canAddPackageWeight(pkg.weight)) {
-        this.placePackageOptimized(pkg);
-      }
-    }
-  }
-
-  private findBestPositionForRotation(rotation: Rotation, minHeight: number): Position | null {
-    let bestPosition: Position | null = null;
-    let lowestScore = Infinity;
-
-    for (const position of this.availablePositions) {
-      if (position.y >= minHeight && this.canPlaceAtPosition(rotation, position)) {
-        const score = this.evaluateSpaceEfficiency(position, rotation);
-        if (score < lowestScore) {
-          lowestScore = score;
-          bestPosition = position;
-        }
-      }
-    }
-
-    return bestPosition;
-  }
-
-  private getMaxHeight(): number {
-    if (this.placedPackages.length === 0) {
-      return this.palletConfig.baseHeight;
-    }
-    return Math.max(...this.placedPackages.map(pkg => pkg.y + pkg.actualHeight));
-  }
-
-  private tryBasicPacking(packages: Package[]): PlacedPackage[] {
-    this.placedPackages = [];
-    this.initializePositions();
-
-    // Try multiple sorting strategies for better optimization
+    // Try different optimization strategies
     const strategies = [
-      // Strategy 1: Volume-based (largest first)
-      [...packages].sort((a, b) => 
-        (b.length * b.width * b.height) - (a.length * a.width * a.height)
-      ),
-      // Strategy 2: Height-based (tallest first)
-      [...packages].sort((a, b) => b.height - a.height),
-      // Strategy 3: Weight-based (heaviest first)
-      [...packages].sort((a, b) => b.weight - a.weight),
-      // Strategy 4: Area-based (largest base area first)
-      [...packages].sort((a, b) => 
-        (b.length * b.width) - (a.length * a.width)
-      ),
-      // Strategy 5: Volume density-based (highest density first)
-      [...packages].sort((a, b) => 
-        (b.weight / (b.length * b.width * b.height)) -
-        (a.weight / (a.length * a.width * a.height))
-      ),
+      () => this.layerBasedPacking(packageTypes),
+      () => this.hybridPacking(packageTypes),
+      () => this.uniformPackingOptimization(packageTypes),
+      () => this.greedyPacking(expandedPackages)
     ];
 
     let bestResult: PlacedPackage[] = [];
+    let bestScore = -1;
+
+    for (const strategy of strategies) {
+      const result = strategy();
+      const score = this.evaluatePackingQuality(result);
+      
+      if (score > bestScore) {
+        bestScore = score;
+        bestResult = result;
+      }
+    }
+
+    return bestResult;
+  }
+
+  private groupPackagesByType(packages: Package[]): PackageType[] {
+    const typeMap = new Map<string, PackageType>();
+
+    for (const pkg of packages) {
+      const key = `${pkg.length}x${pkg.width}x${pkg.height}x${pkg.weight}x${pkg.rotationType}`;
+      
+      if (!typeMap.has(key)) {
+        typeMap.set(key, {
+          dimensions: { length: pkg.length, width: pkg.width, height: pkg.height },
+          count: 0,
+          weight: pkg.weight,
+          rotationType: pkg.rotationType,
+          packages: []
+        });
+      }
+      
+      const type = typeMap.get(key)!;
+      type.count++;
+      type.packages.push(pkg);
+    }
+
+    return Array.from(typeMap.values()).sort((a, b) => b.count - a.count);
+  }
+
+  private layerBasedPacking(packageTypes: PackageType[]): PlacedPackage[] {
+    this.placedPackages = [];
+    this.initializePositions();
+
+    const layers: LayerPlan[] = [];
+    let currentHeight = this.palletConfig.baseHeight;
+    const remainingPackages = new Map<string, Package[]>();
+    
+    // Initialize remaining packages
+    for (const type of packageTypes) {
+      const key = this.getTypeKey(type);
+      remainingPackages.set(key, [...type.packages]);
+    }
+
+    while (currentHeight < this.palletConfig.baseHeight + this.palletConfig.loadHeight) {
+      const layer = this.createOptimalLayer(remainingPackages, currentHeight);
+      
+      if (layer.packages.length === 0) break;
+      
+      layers.push(layer);
+      currentHeight += layer.height;
+      
+      // Remove used packages
+      for (const pkg of layer.packages) {
+        const typeKey = this.getPackageTypeKey(pkg);
+        const remaining = remainingPackages.get(typeKey) || [];
+        const index = remaining.findIndex(p => p.id === pkg.id);
+        if (index >= 0) {
+          remaining.splice(index, 1);
+        }
+      }
+    }
+
+    // Combine all layers
+    const result: PlacedPackage[] = [];
+    for (const layer of layers) {
+      result.push(...layer.packages);
+    }
+
+    return result;
+  }
+
+  private createOptimalLayer(remainingPackages: Map<string, Package[]>, startHeight: number): LayerPlan {
+    const availableHeight = this.palletConfig.baseHeight + this.palletConfig.loadHeight - startHeight;
+    const bestPlans: LayerPlan[] = [];
+
+    // Try different layer strategies
+    for (const [typeKey, packages] of remainingPackages) {
+      if (packages.length === 0) continue;
+
+      const samplePackage = packages[0];
+      const rotations = this.generateRotations(samplePackage);
+
+      for (const rotation of rotations) {
+        if (rotation.height > availableHeight) continue;
+
+        const plan = this.createUniformLayer(packages, rotation, startHeight);
+        if (plan.packages.length > 0) {
+          bestPlans.push(plan);
+        }
+      }
+    }
+
+    // Try mixed layer with smaller packages
+    const mixedPlan = this.createMixedLayer(remainingPackages, startHeight, availableHeight);
+    if (mixedPlan.packages.length > 0) {
+      bestPlans.push(mixedPlan);
+    }
+
+    // Return best plan
+    return bestPlans.reduce((best, current) => 
+      current.efficiency > best.efficiency ? current : best,
+      { packages: [], height: 0, efficiency: 0 }
+    );
+  }
+
+  private createUniformLayer(packages: Package[], rotation: Rotation, startHeight: number): LayerPlan {
+    const layerPackages: PlacedPackage[] = [];
+    const palletLength = this.palletConfig.length;
+    const palletWidth = this.palletConfig.width;
+
+    // Calculate how many packages fit in each direction
+    const packagesPerRow = Math.floor(palletLength / rotation.length);
+    const packagesPerColumn = Math.floor(palletWidth / rotation.width);
+    const maxPackagesInLayer = packagesPerRow * packagesPerColumn;
+
+    let currentWeight = this.getCurrentWeight();
+    let packageIndex = 0;
+
+    for (let col = 0; col < packagesPerColumn && packageIndex < packages.length; col++) {
+      for (let row = 0; row < packagesPerRow && packageIndex < packages.length; row++) {
+        const pkg = packages[packageIndex];
+        
+        if (currentWeight + pkg.weight > this.palletConfig.maxWeight) {
+          break;
+        }
+
+        const x = row * rotation.length;
+        const z = col * rotation.width;
+        const position: Position = { x, y: startHeight, z };
+
+        const placedPackage = this.createPlacedPackage(pkg, position, rotation);
+        layerPackages.push(placedPackage);
+        currentWeight += pkg.weight;
+        packageIndex++;
+      }
+    }
+
+    const efficiency = this.calculateLayerEfficiency(layerPackages, rotation.height);
+    return {
+      packages: layerPackages,
+      height: rotation.height,
+      efficiency
+    };
+  }
+
+  private createMixedLayer(remainingPackages: Map<string, Package[]>, startHeight: number, availableHeight: number): LayerPlan {
+    const layerPackages: PlacedPackage[] = [];
+    const occupiedSpaces: { x1: number; x2: number; z1: number; z2: number }[] = [];
+    
+    // Collect all suitable packages for this layer
+    const suitablePackages: { pkg: Package; rotation: Rotation; priority: number }[] = [];
+    
+    for (const [typeKey, packages] of remainingPackages) {
+      for (const pkg of packages) {
+        const rotations = this.generateRotations(pkg);
+        for (const rotation of rotations) {
+          if (rotation.height <= availableHeight) {
+            const priority = this.calculatePackagePriority(pkg, rotation);
+            suitablePackages.push({ pkg, rotation, priority });
+          }
+        }
+      }
+    }
+
+    // Sort by priority (higher first)
+    suitablePackages.sort((a, b) => b.priority - a.priority);
+
+    let currentWeight = this.getCurrentWeight();
+    
+    for (const { pkg, rotation } of suitablePackages) {
+      if (currentWeight + pkg.weight > this.palletConfig.maxWeight) continue;
+      
+      const position = this.findBestPositionInLayer(rotation, startHeight, occupiedSpaces);
+      if (position) {
+        const placedPackage = this.createPlacedPackage(pkg, position, rotation);
+        layerPackages.push(placedPackage);
+        currentWeight += pkg.weight;
+        
+        occupiedSpaces.push({
+          x1: position.x,
+          x2: position.x + rotation.length,
+          z1: position.z,
+          z2: position.z + rotation.width
+        });
+      }
+    }
+
+    const maxHeight = layerPackages.reduce((max, pkg) => Math.max(max, pkg.actualHeight), 0);
+    const efficiency = this.calculateLayerEfficiency(layerPackages, maxHeight);
+    
+    return {
+      packages: layerPackages,
+      height: maxHeight,
+      efficiency
+    };
+  }
+
+  private findBestPositionInLayer(rotation: Rotation, layerY: number, occupiedSpaces: { x1: number; x2: number; z1: number; z2: number }[]): Position | null {
+    const stepSize = 0.01; // 1cm resolution
+    
+    for (let z = 0; z <= this.palletConfig.width - rotation.width; z += stepSize) {
+      for (let x = 0; x <= this.palletConfig.length - rotation.length; x += stepSize) {
+        const position: Position = { x, y: layerY, z };
+        
+        // Check if this position conflicts with occupied spaces
+        const conflicts = occupiedSpaces.some(space => 
+          !(x + rotation.length <= space.x1 || x >= space.x2 || 
+            z + rotation.width <= space.z1 || z >= space.z2)
+        );
+        
+        if (!conflicts && this.canPlaceAtPosition(rotation, position)) {
+          return position;
+        }
+      }
+    }
+    
+    return null;
+  }
+
+  private calculatePackagePriority(pkg: Package, rotation: Rotation): number {
+    const volume = rotation.length * rotation.width * rotation.height;
+    const density = pkg.weight / volume;
+    const baseArea = rotation.length * rotation.width;
+    
+    // Prioritize: higher density, larger base area, original orientation
+    let priority = density * 1000 + baseArea * 100;
+    
+    // Bonus for original orientation
+    if (rotation.length === pkg.length && rotation.width === pkg.width && rotation.height === pkg.height) {
+      priority += 50;
+    }
+    
+    return priority;
+  }
+
+  private calculateLayerEfficiency(packages: PlacedPackage[], layerHeight: number): number {
+    if (packages.length === 0) return 0;
+    
+    const totalPackageVolume = packages.reduce((sum, pkg) => 
+      sum + (pkg.actualLength * pkg.actualWidth * pkg.actualHeight), 0);
+    
+    const layerVolume = this.palletConfig.length * this.palletConfig.width * layerHeight;
+    const volumeEfficiency = totalPackageVolume / layerVolume;
+    
+    const packageCount = packages.length;
+    const maxPossiblePackages = Math.floor(layerVolume / Math.min(...packages.map(p => 
+      p.actualLength * p.actualWidth * p.actualHeight)));
+    const countEfficiency = packageCount / maxPossiblePackages;
+    
+    return volumeEfficiency * 0.7 + countEfficiency * 0.3;
+  }
+
+  private uniformPackingOptimization(packageTypes: PackageType[]): PlacedPackage[] {
+    let bestResult: PlacedPackage[] = [];
     let bestCount = 0;
 
-    // Try each strategy and keep the best result
+    // Focus on the most common package types first
+    for (const type of packageTypes.slice(0, 3)) { // Top 3 most common types
+      const result = this.optimizeForSingleType(type);
+      if (result.length > bestCount) {
+        bestCount = result.length;
+        bestResult = result;
+      }
+    }
+
+    return bestResult;
+  }
+
+  private optimizeForSingleType(type: PackageType): PlacedPackage[] {
+    this.placedPackages = [];
+    this.initializePositions();
+
+    const rotations = this.generateRotations(type.packages[0]);
+    let bestResult: PlacedPackage[] = [];
+    let bestCount = 0;
+
+    for (const rotation of rotations) {
+      this.placedPackages = [];
+      const result = this.packUniformBoxes(type.packages, rotation);
+      
+      if (result.length > bestCount) {
+        bestCount = result.length;
+        bestResult = [...result];
+      }
+    }
+
+    return bestResult;
+  }
+
+  private packUniformBoxes(packages: Package[], rotation: Rotation): PlacedPackage[] {
+    const result: PlacedPackage[] = [];
+    const palletLength = this.palletConfig.length;
+    const palletWidth = this.palletConfig.width;
+    const palletHeight = this.palletConfig.loadHeight;
+
+    // Calculate optimal arrangement
+    const packagesPerRow = Math.floor(palletLength / rotation.length);
+    const packagesPerColumn = Math.floor(palletWidth / rotation.width);
+    const layersCount = Math.floor(palletHeight / rotation.height);
+
+    const totalCapacity = packagesPerRow * packagesPerColumn * layersCount;
+    const packagesToPlace = Math.min(packages.length, totalCapacity);
+
+    let currentWeight = 0;
+    let packageIndex = 0;
+
+    for (let layer = 0; layer < layersCount && packageIndex < packagesToPlace; layer++) {
+      const y = this.palletConfig.baseHeight + (layer * rotation.height);
+      
+      for (let col = 0; col < packagesPerColumn && packageIndex < packagesToPlace; col++) {
+        for (let row = 0; row < packagesPerRow && packageIndex < packagesToPlace; row++) {
+          const pkg = packages[packageIndex];
+          
+          if (currentWeight + pkg.weight > this.palletConfig.maxWeight) {
+            return result;
+          }
+
+          const x = row * rotation.length;
+          const z = col * rotation.width;
+          const position: Position = { x, y, z };
+
+          const placedPackage = this.createPlacedPackage(pkg, position, rotation);
+          result.push(placedPackage);
+          currentWeight += pkg.weight;
+          packageIndex++;
+        }
+      }
+    }
+
+    return result;
+  }
+
+  private hybridPacking(packageTypes: PackageType[]): PlacedPackage[] {
+    this.placedPackages = [];
+    this.initializePositions();
+
+    // Start with the most common package type
+    if (packageTypes.length > 0) {
+      const primaryType = packageTypes[0];
+      const primaryResult = this.optimizeForSingleType(primaryType);
+      this.placedPackages = [...primaryResult];
+    }
+
+    // Fill remaining space with other packages
+    const usedIds = new Set(this.placedPackages.map(p => p.id));
+    const remainingPackages: Package[] = [];
+    
+    for (const type of packageTypes) {
+      for (const pkg of type.packages) {
+        if (!usedIds.has(pkg.id)) {
+          remainingPackages.push(pkg);
+        }
+      }
+    }
+
+    // Use greedy approach for remaining packages
+    this.updateAvailablePositionsFromPlaced();
+    for (const pkg of remainingPackages) {
+      if (this.canAddPackageWeight(pkg.weight)) {
+        this.placePackageOptimized(pkg);
+      }
+    }
+
+    return this.placedPackages;
+  }
+
+  private updateAvailablePositionsFromPlaced(): void {
+    this.availablePositions = [{ x: 0, y: this.palletConfig.baseHeight, z: 0 }];
+    
+    for (const pkg of this.placedPackages) {
+      this.updateAvailablePositions(pkg);
+    }
+  }
+
+  private greedyPacking(packages: Package[]): PlacedPackage[] {
+    // This is the improved version of the original tryBasicPacking
+    this.placedPackages = [];
+    this.initializePositions();
+
+    const strategies = [
+      // Volume-based (largest first)
+      [...packages].sort((a, b) => 
+        (b.length * b.width * b.height) - (a.length * a.width * a.height)
+      ),
+      // Height-based (tallest first)
+      [...packages].sort((a, b) => b.height - a.height),
+      // Base area (largest base first)
+      [...packages].sort((a, b) => 
+        (b.length * b.width) - (a.length * a.width)
+      ),
+      // Weight density
+      [...packages].sort((a, b) => {
+        const densityA = a.weight / (a.length * a.width * a.height);
+        const densityB = b.weight / (b.length * b.width * b.height);
+        return densityB - densityA;
+      })
+    ];
+
+    let bestResult: PlacedPackage[] = [];
+    let bestScore = 0;
+
     for (const sortedPackages of strategies) {
       this.placedPackages = [];
       this.initializePositions();
@@ -272,8 +480,9 @@ export class BinPackingAlgorithm {
         }
       }
 
-      if (this.placedPackages.length > bestCount) {
-        bestCount = this.placedPackages.length;
+      const score = this.evaluatePackingQuality(this.placedPackages);
+      if (score > bestScore) {
+        bestScore = score;
         bestResult = [...this.placedPackages];
       }
     }
@@ -281,6 +490,33 @@ export class BinPackingAlgorithm {
     return bestResult;
   }
 
+  private evaluatePackingQuality(packages: PlacedPackage[]): number {
+    if (packages.length === 0) return 0;
+
+    const totalVolume = packages.reduce((sum, pkg) => 
+      sum + (pkg.actualLength * pkg.actualWidth * pkg.actualHeight), 0);
+    
+    const palletVolume = this.palletConfig.length * this.palletConfig.width * this.palletConfig.loadHeight;
+    const volumeUtilization = totalVolume / palletVolume;
+    
+    const packageCount = packages.length;
+    const weightUtilization = this.getCurrentWeight() / this.palletConfig.maxWeight;
+    
+    // Weighted score: 50% volume, 30% count, 20% weight utilization
+    return volumeUtilization * 0.5 + (packageCount / 1000) * 0.3 + weightUtilization * 0.2;
+  }
+
+  // Helper methods
+  private getTypeKey(type: PackageType): string {
+    return `${type.dimensions.length}x${type.dimensions.width}x${type.dimensions.height}x${type.weight}x${type.rotationType}`;
+  }
+
+  private getPackageTypeKey(pkg: PlacedPackage): string {
+    // Reverse engineer the original package dimensions
+    return `${pkg.length}x${pkg.width}x${pkg.height}x${pkg.weight}x${pkg.rotationType}`;
+  }
+
+  // Existing methods (improved versions)
   private expandPackages(packages: Package[]): Package[] {
     const expanded: Package[] = [];
     for (const pkg of packages) {
@@ -303,9 +539,9 @@ export class BinPackingAlgorithm {
     for (const rotation of rotations) {
       for (const position of this.availablePositions) {
         if (this.canPlaceAtPosition(rotation, position)) {
-          const volumeUtilization = this.evaluateSpaceEfficiency(position, rotation);
-          if (volumeUtilization < bestScore) {
-            bestScore = volumeUtilization;
+          const score = this.evaluatePositionScore(position, rotation);
+          if (score < bestScore) {
+            bestScore = score;
             bestPosition = position;
             bestRotation = rotation;
           }
@@ -324,12 +560,27 @@ export class BinPackingAlgorithm {
     return false;
   }
 
-  private evaluateSpaceEfficiency(position: Position, rotation: Rotation): number {
+  private evaluatePositionScore(position: Position, rotation: Rotation): number {
+    // Lower score is better
     const { x, y, z } = position;
-    const emptyAbove = this.palletConfig.baseHeight + this.palletConfig.loadHeight - (y + rotation.height);
-    const emptyRight = this.palletConfig.length - (x + rotation.length);
-    const emptyFront = this.palletConfig.width - (z + rotation.width);
-    return emptyAbove + emptyRight + emptyFront; // smaller sum = better fit
+    
+    // Prefer positions that are lower, towards back-left
+    const heightScore = y * 10;
+    const positionScore = z * 5 + x * 2;
+    
+    // Penalize wasted space
+    const wastedSpace = this.calculateWastedSpace(position, rotation);
+    
+    return heightScore + positionScore + wastedSpace;
+  }
+
+  private calculateWastedSpace(position: Position, rotation: Rotation): number {
+    const { x, y, z } = position;
+    const rightSpace = this.palletConfig.length - (x + rotation.length);
+    const frontSpace = this.palletConfig.width - (z + rotation.width);
+    const topSpace = (this.palletConfig.baseHeight + this.palletConfig.loadHeight) - (y + rotation.height);
+    
+    return rightSpace + frontSpace + topSpace * 0.5; // Height waste is less critical
   }
 
   private generateRotations(pkg: Package): Rotation[] {
@@ -397,7 +648,6 @@ export class BinPackingAlgorithm {
   }
 
   private checkCollision(box1: any, box2: any): boolean {
-    // Use tolerance for collision detection
     return !(
       approxLessOrEqual(box1.x + box1.length, box2.x) ||
       approxLessOrEqual(box2.x + box2.length, box1.x) ||
@@ -424,64 +674,29 @@ export class BinPackingAlgorithm {
   private updateAvailablePositions(placedPackage: PlacedPackage): void {
     const newPositions: Position[] = [];
 
-    // Generate positions more densely for better packing
-    const stepSize = 0.01; // 1cm steps
-    
-    // Right of the package
-    newPositions.push({
-      x: placedPackage.x + placedPackage.actualLength,
-      y: placedPackage.y,
-      z: placedPackage.z,
-    });
+    // Strategic position generation
+    const positions = [
+      // Adjacent positions
+      { x: placedPackage.x + placedPackage.actualLength, y: placedPackage.y, z: placedPackage.z },
+      { x: placedPackage.x, y: placedPackage.y, z: placedPackage.z + placedPackage.actualWidth },
+      { x: placedPackage.x, y: placedPackage.y + placedPackage.actualHeight, z: placedPackage.z },
+      
+      // Corner positions
+      { x: placedPackage.x + placedPackage.actualLength, y: placedPackage.y + placedPackage.actualHeight, z: placedPackage.z },
+      { x: placedPackage.x, y: placedPackage.y + placedPackage.actualHeight, z: placedPackage.z + placedPackage.actualWidth },
+      { x: placedPackage.x + placedPackage.actualLength, y: placedPackage.y, z: placedPackage.z + placedPackage.actualWidth },
+      { x: placedPackage.x + placedPackage.actualLength, y: placedPackage.y + placedPackage.actualHeight, z: placedPackage.z + placedPackage.actualWidth },
+    ];
 
-    // In front of the package
-    newPositions.push({
-      x: placedPackage.x,
-      y: placedPackage.y,
-      z: placedPackage.z + placedPackage.actualWidth,
-    });
-
-    // Above the package
-    newPositions.push({
-      x: placedPackage.x,
-      y: placedPackage.y + placedPackage.actualHeight,
-      z: placedPackage.z,
-    });
-
-    // Add corner positions for better space utilization
-    newPositions.push({
-      x: placedPackage.x + placedPackage.actualLength,
-      y: placedPackage.y + placedPackage.actualHeight,
-      z: placedPackage.z,
-    });
-
-    newPositions.push({
-      x: placedPackage.x,
-      y: placedPackage.y + placedPackage.actualHeight,
-      z: placedPackage.z + placedPackage.actualWidth,
-    });
-
-    newPositions.push({
-      x: placedPackage.x + placedPackage.actualLength,
-      y: placedPackage.y,
-      z: placedPackage.z + placedPackage.actualWidth,
-    });
-
-    // Corner-edge strategy position
-    newPositions.push({
-      x: placedPackage.x + placedPackage.actualLength,
-      y: placedPackage.y + placedPackage.actualHeight,
-      z: placedPackage.z + placedPackage.actualWidth,
-    });
-
-    // Add valid new positions
-    for (const pos of newPositions) {
+    for (const pos of positions) {
       if (this.isValidPosition(pos) && !this.positionExists(pos)) {
-        this.availablePositions.push(pos);
+        newPositions.push(pos);
       }
     }
 
-    // Sort positions by priority (bottom-left-front strategy)
+    this.availablePositions.push(...newPositions);
+
+    // Sort positions by priority (bottom-left-back strategy)
     this.availablePositions.sort((a, b) => {
       if (!approxEqual(a.y, b.y)) return a.y - b.y;
       if (!approxEqual(a.z, b.z)) return a.z - b.z;
@@ -520,5 +735,31 @@ export class BinPackingAlgorithm {
 
   public canAddPackageWeight(packageWeight: number): boolean {
     return this.getCurrentWeight() + packageWeight <= this.palletConfig.maxWeight;
+  }
+
+  // Additional utility methods
+  public getPackingStatistics(): {
+    totalVolume: number;
+    usedVolume: number;
+    volumeUtilization: number;
+    totalWeight: number;
+    weightUtilization: number;
+    packageCount: number;
+  } {
+    const usedVolume = this.placedPackages.reduce((total, pkg) => {
+      return total + (pkg.actualLength * pkg.actualWidth * pkg.actualHeight);
+    }, 0);
+    
+    const totalVolume = this.palletConfig.length * this.palletConfig.width * this.palletConfig.loadHeight;
+    const totalWeight = this.getCurrentWeight();
+    
+    return {
+      totalVolume,
+      usedVolume,
+      volumeUtilization: usedVolume / totalVolume,
+      totalWeight,
+      weightUtilization: totalWeight / this.palletConfig.maxWeight,
+      packageCount: this.placedPackages.length
+    };
   }
 }
